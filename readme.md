@@ -42,8 +42,7 @@ cd Docs-to-md-via-LLMs
 - PDF documents
 - HTML pages
 - Word documents
-- Excel spreadsheets
-- And more!
+- Excel spreadsheets 
 
 #### License
 This project is licensed under the MIT License - see the LICENSE file for details.
