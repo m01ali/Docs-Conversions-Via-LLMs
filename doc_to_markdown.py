@@ -14,11 +14,11 @@ from openai import OpenAI
 # Import document processing libraries
 import fitz  # PyMuPDF for PDF
 from pdf2image import convert_from_path
-import pytesseract
+import pytesseract 
 from docx import Document
 import pandas as pd
-import openpyxl
-from bs4 import BeautifulSoup
+import openpyxl #excel
+from bs4 import BeautifulSoup # HTML parsing
 import markdown
 import requests
 
