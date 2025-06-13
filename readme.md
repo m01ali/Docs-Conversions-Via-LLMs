@@ -34,9 +34,6 @@ cd Docs-to-md-via-LLMs
 
 `python doc_to_markdown.py path/to/your/document.pdf`
 
-**GUI Interface:**
-
-`python gui.py`
 
 ### Supported File Types
 - PDF documents

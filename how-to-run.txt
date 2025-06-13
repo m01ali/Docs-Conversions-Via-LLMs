@@ -1,5 +1,2 @@
 CLI Command:
-python doc_to_markdown.py --api-key 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 --site-url example.com --site-name example.com E:\Docs-to-md-via-LLMs\test-pdfdoc.pdf
-
-Gui:
-python gui.py
+python doc_to_markdown.py --api-key [Your-key] --site-url example.com --site-name example.com E:\Docs-to-md-via-LLMs\test-pdfdoc.pdf
