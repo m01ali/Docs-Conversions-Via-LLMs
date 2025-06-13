@@ -53,9 +53,18 @@ class DocumentConverter:
         
         print(f"Converting {input_path} to Markdown...")
         
-        # Check if we can use markitdown CLI directly
         if self._try_markitdown_cli(input_path, output_path):
             print(f"Successfully converted using markitdown CLI to {output_path}")
+            
+            # Special handling for PDF images
+            if input_path.lower().endswith('.pdf'):
+                print("Adding PDF images to the converted markdown...")
+                self._extract_images_from_pdf_post_markitdown(input_path, output_path)
+            
+            # Continue with normal processing
+            self._extract_base64_images(output_path)
+            self._fix_placeholder_image_references(output_path)
+            self._enhance_with_llm(output_path)
             return output_path
         
         # If markitdown CLI fails or isn't suitable, use our custom conversion methods
@@ -74,16 +83,84 @@ class DocumentConverter:
             
         # Post-process to enhance formatting
         self._enhance_with_llm(output_path)
+        
+        # After conversion is complete
+        self._verify_image_paths(output_path)
             
         print(f"Successfully converted to {output_path}")
         return output_path
     
+    def _extract_images_from_pdf_post_markitdown(self, pdf_path, markdown_path):
+        """Extract images from PDF and add them to the markdown after MarkItDown conversion"""
+        pdf_document = fitz.open(pdf_path)
+        extracted_images = []
+        
+        # Read existing markdown content
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            markdown_content = f.read()
+        
+        # Extract images from all pages
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            image_list = page.get_images(full=True)
+            
+            if image_list:
+                for img_index, img_info in enumerate(image_list):
+                    xref = img_info[0]
+                    base_img = pdf_document.extract_image(xref)
+                    image_bytes = base_img["image"]
+                    
+                    # Save image
+                    img_filename = f"image_p{page_num+1}_{img_index+1}.{base_img['ext']}"
+                    img_path = os.path.join(self.images_dir, img_filename)
+                    
+                    try:
+                        with open(img_path, "wb") as img_file:
+                            img_file.write(image_bytes)
+                        
+                        print(f"Extracted image to {img_path}")
+                        extracted_images.append((img_filename))
+                    except Exception as e:
+                        print(f"Error saving image: {e}")
+            else:
+                # If no vectorized images found, try rendering page as image
+                pix = page.get_pixmap(alpha=False)
+                img_filename = f"page_{page_num+1}.png"
+                img_path = os.path.join(self.images_dir, img_filename)
+                
+                try:
+                    pix.save(img_path)
+                    print(f"Rendered page {page_num+1} as image: {img_path}")
+                    extracted_images.append((img_filename))
+                except Exception as e:
+                    print(f"Error saving page image: {e}")
+        
+        # Append image references to the markdown content if any images were found
+        if extracted_images:
+            img_rel_path = f"images/{img_filename}".replace('\\', '/')
+            markdown_content += f"![Image from document]({img_rel_path})\n\n"
+            for img_filename in extracted_images:
+                markdown_content += f"![Image from document](images/{img_filename})\n\n"
+            
+            # Write updated markdown
+            with open(markdown_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_content)
+            
+            print(f"Added {len(extracted_images)} image references to the markdown")
+        
+        pdf_document.close()
+    
+    
     def _try_markitdown_cli(self, input_path, output_path):
         """Attempt to use markitdown CLI tool if available"""
+        if input_path.lower().endswith('.pdf'):
+            return False
+
+        
         try:
             # Check if markitdown CLI is installed and works for this file type
             result = subprocess.run(
-                ["markitdown", "--input", input_path, "--output", output_path],
+                ["markitdown", input_path, "-o", output_path, "--keep-data-uris"],
                 capture_output=True,
                 text=True,
                 check=False  # Don't raise exception on non-zero return code
@@ -119,47 +196,95 @@ class DocumentConverter:
         return image_paths
     
     def _convert_pdf(self, pdf_path, output_path):
-        """Convert PDF to Markdown with images and tables preserved"""
+        """Enhanced PDF to Markdown conversion with robust image handling"""
         pdf_document = fitz.open(pdf_path)
         markdown_content = []
+        image_references = []
         
+        # Step 1: Extract all text for LLM processing
+        print("Extracting text from PDF...")
+        all_text = ""
         for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
-            
-            # Extract text
             text = page.get_text()
+            if text.strip():
+                all_text += text + "\n\n"
+        
+        # Step 2: Use LLM to format the text as markdown
+        print("Converting text to markdown with LLM...")
+        formatted_markdown = self._convert_with_llm(all_text, "pdf")
+        if not formatted_markdown:
+            formatted_markdown = all_text  # Fallback to raw text if LLM fails
+        
+        # Step 3: Extract and save images completely separately from text
+        print("Extracting images from PDF...")
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            image_list = page.get_images(full=True)
             
-            # Extract images
-            image_paths = self._extract_images_from_pdf(pdf_path, page_num)
-            
-            # If text extraction doesn't work well, use OCR as fallback
-            if not text.strip() or len(text) < 100:
-                images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
-                if images:
-                    ocr_img = images[0]
-                    ocr_img_path = os.path.join(self.temp_dir, f"page_{page_num}.png")
-                    ocr_img.save(ocr_img_path)
-                    text = pytesseract.image_to_string(ocr_img_path)
-            
-            # Convert tables using LLM if needed
-            tables = self._extract_tables_from_text(text)
-            
-            # Format page content
-            page_content = text
-            
-            # Add images to markdown
-            for img_path, img_filename in image_paths:
-                relative_path = os.path.join("images", img_filename)
-                page_content += f"\n\n![Image]({relative_path})\n\n"
-            
-            markdown_content.append(page_content)
+            if image_list:
+                for img_index, img_info in enumerate(image_list):
+                    xref = img_info[0]
+                    base_img = pdf_document.extract_image(xref)
+                    image_bytes = base_img["image"]
+                    
+                    # Create unique image filename
+                    img_filename = f"image_p{page_num+1}_{img_index+1}.{base_img['ext']}"
+                    img_path = os.path.join(self.images_dir, img_filename)
+                    
+                    # Save the image
+                    try:
+                        with open(img_path, "wb") as img_file:
+                            img_file.write(image_bytes)
+                        print(f"Extracted image to {img_path}")
+                        
+                        # Create a markdown-compatible reference using RELATIVE path
+                        rel_img_path = os.path.join("images", img_filename).replace("\\", "/")
+                        image_references.append(f"![Image from page {page_num+1}]({rel_img_path})")
+                    except Exception as e:
+                        print(f"Error saving image: {e}")
+            else:
+                # If no vector images, try rendering page as image
+                pix = page.get_pixmap(alpha=False)
+                img_filename = f"page_{page_num+1}.png"
+                img_path = os.path.join(self.images_dir, img_filename)
+                
+                try:
+                    pix.save(img_path)
+                    print(f"Rendered page {page_num+1} as image: {img_path}")
+                    
+                    # Create a markdown-compatible reference using RELATIVE path
+                    rel_img_path = os.path.join("images", img_filename).replace("\\", "/")
+                    image_references.append(f"![Page {page_num+1}]({rel_img_path})")
+                except Exception as e:
+                    print(f"Error saving page image: {e}")
+        
+        pdf_document.close()
+        
+        # Step 4: Create a test HTML file to verify image display
+        html_test_path = os.path.join(os.path.dirname(output_path), "image_test.html")
+        with open(html_test_path, 'w', encoding='utf-8') as f:
+            f.write("<html><body>\n")
+            for img_ref in image_references:
+                img_path = img_ref.split('(')[1].split(')')[0]
+                f.write(f'<p><img src="{img_path}" alt="Test image"></p>\n')
+            f.write("</body></html>")
+        
+        # Step 5: Combine text and images in final markdown
+        final_markdown = formatted_markdown
+        if image_references:
+            final_markdown += "\n\n## Document Images\n\n"
+            final_markdown += "\n\n".join(image_references)
         
         # Write markdown content to file
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n\n'.join(markdown_content))
-            
-        pdf_document.close()
-    
+            f.write(final_markdown)
+        
+        print(f"PDF successfully converted to {output_path} with {len(image_references)} images")
+        print(f"To verify image paths, open {html_test_path} in a browser")
+        
+        return output_path
+
     def _convert_docx(self, docx_path, output_path):
         """Convert DOCX to Markdown with images and tables preserved"""
         doc = Document(docx_path)
@@ -350,6 +475,68 @@ class DocumentConverter:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(content)
     
+    def _extract_base64_images(self, markdown_path):
+        """Extract base64 images to files and update markdown references"""
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Find data URLs
+        pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)'
+        matches = list(re.finditer(pattern, content))
+        
+        if not matches:
+            return  # No base64 images found
+            
+        print(f"Found {len(matches)} base64-encoded images to extract")
+        
+        def replace_match(match):
+            alt_text = match.group(1)
+            image_type = match.group(2)
+            base64_data = match.group(3)
+            
+            # Generate image filename - FIX: Convert hash to string before slicing
+            img_filename = f"image_{str(hash(base64_data))[:8]}.{image_type}"
+            img_path = os.path.join(self.images_dir, img_filename)
+            
+            # Save image file
+            try:
+                with open(img_path, 'wb') as img_file:
+                    img_file.write(base64.b64decode(base64_data))
+                
+                print(f"Extracted image to {img_path}")
+                # Return updated markdown reference
+                return f'![{alt_text}](images/{img_filename})'
+            except Exception as e:
+                print(f"Failed to extract image: {e}")
+                return match.group(0)  # Return original if failed
+        
+        # Replace all data URLs
+        updated_content = re.sub(pattern, replace_match, content)
+        
+        # Write updated markdown
+        with open(markdown_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+        
+    def _fix_placeholder_image_references(self, markdown_path):
+        """Replace placeholder image references with actual image paths"""
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Check for placeholder patterns
+        if 'path_to_image' in content:
+            print("Found placeholder image references, replacing...")
+            
+            # Replace placeholders with sample images if available
+            # You can add actual sample images to your images directory
+            sample_img1 = os.path.join("images", "sample_image1.png")
+            sample_img2 = os.path.join("images", "sample_image2.png")
+            
+            content = content.replace('(path_to_image1)', f'({sample_img1})')
+            content = content.replace('(path_to_image2)', f'({sample_img2})')
+            
+            with open(markdown_path, 'w', encoding='utf-8') as f:
+                f.write(content)    
+        
     def _extract_tables_from_text(self, text):
         """Extract table-like structures from text"""
         # This is a simplified approach - in a real implementation, 
@@ -371,42 +558,128 @@ class DocumentConverter:
         
         return tables
     
+    def _verify_image_paths(self, markdown_path):
+        """Verify image paths in markdown file and create HTML test file"""
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Extract image paths
+        import re
+        image_regex = r'!\[.*?\]\((.*?)\)'
+        image_paths = re.findall(image_regex, content)
+        
+        if not image_paths:
+            print("No image references found in markdown")
+            return
+        
+        print(f"Found {len(image_paths)} image references:")
+        for i, path in enumerate(image_paths):
+            full_path = os.path.join(os.path.dirname(markdown_path), path)
+            exists = os.path.exists(full_path)
+            print(f"  {i+1}. {path} - {'EXISTS' if exists else 'MISSING'}")
+        
+        # Create a simple HTML file to test image display
+        html_path = markdown_path.replace('.md', '_images.html')
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write("<html><body>\n")
+            f.write("<h1>Image Reference Test</h1>\n")
+            for i, path in enumerate(image_paths):
+                f.write(f'<h2>Image {i+1}</h2>\n')
+                f.write(f'<p>Path: {path}</p>\n')
+                f.write(f'<img src="{path}" style="max-width:800px;"><hr>\n')
+            f.write("</body></html>")
+        
+        print(f"Created HTML test file: {html_path}")
+        print(f"Open this file in a browser to check if images display correctly")
+    
+    
     def _convert_with_llm(self, content, source_format):
-        """Use LLM to convert content to markdown"""
-        try:
-            prompt = f"""
-            Convert the following {source_format} content to well-formatted markdown. 
-            Preserve all tables, images, formatting, and structure.
-            For images, use the existing image paths.
-            Make sure tables are properly formatted with header separators.
-
-            Content:
-            {content[:10000]}  # Limit content length to avoid token limits
-            """
+        """Use LLM to convert content from various formats to Markdown
+        
+        Args:
+            content (str): The raw content to convert
+            source_format (str): The format of the source content (e.g., "pdf", "html")
             
-            completion = self.client.chat.completions.create(
-                extra_headers={
-                    "HTTP-Referer": self.site_url,
-                    "X-Title": self.site_name,
-                },
+        Returns:
+            str: Converted markdown content or None if conversion failed
+        """
+        try:
+            # Get API key directly from command line args
+            import sys
+            api_key = None
+            for i, arg in enumerate(sys.argv):
+                if arg == '--api-key' and i+1 < len(sys.argv):
+                    api_key = sys.argv[i+1]
+                    break
+            
+            if not api_key:
+                print("Error: No API key found. Please provide --api-key parameter.")
+                return None
+            
+            # Customize prompt based on source format
+            if source_format == "pdf":
+                prompt = (
+                    "You are a document conversion specialist. Your task is to convert PDF text to Markdown format WITHOUT summarizing or changing the text content in any way. Follow these rules strictly:\n"
+                    "1. PRESERVE ALL ORIGINAL TEXT EXACTLY. Do not summarize, paraphrase, or omit any content.\n"
+                    "2. Only add minimal Markdown formatting (## for obvious headings, * for bullet lists that already exist)\n"
+                    "3. Preserve the exact paragraph structure as in the original\n"
+                    "4. Keep all examples, code blocks, and technical details exactly as they appear\n"
+                    "5. If you can't determine if something is a heading, keep it as plain text\n"
+                    "\nHere is the PDF text to convert while preserving 100% of the original content:\n\n"
+                )
+            else:
+                prompt = (
+                    f"Convert the following {source_format} content to Markdown WITHOUT changing any text content.\n"
+                    f"PRESERVE EVERY WORD EXACTLY as in the original. Do not summarize or paraphrase.\n"
+                    f"Only add minimal Markdown formatting for structure.\n\n"
+                    f"Content to convert (preserve all text exactly):\n\n"
+                )
+            
+            
+            # Handle content size limitations
+            content_limit = 8000 if source_format == "pdf" else 10000
+            truncated_content = content[:content_limit]
+            prompt += truncated_content
+            
+            # Get site info from command line or use defaults
+            site_url = "example.com"
+            site_name = "Document Converter"
+            
+            for i, arg in enumerate(sys.argv):
+                if arg == '--site-url' and i+1 < len(sys.argv):
+                    site_url = sys.argv[i+1]
+                elif arg == '--site-name' and i+1 < len(sys.argv):
+                    site_name = sys.argv[i+1]
+            
+            # Create OpenAI client with OpenRouter API
+            client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key,
+                default_headers={
+                    "HTTP-Referer": site_url,
+                    "X-Title": site_name
+                }
+            )
+            
+            # Send the conversion request to the API
+            print(f"Sending content to LLM for {source_format} conversion...")
+            completion = client.chat.completions.create(
                 model="openai/gpt-4o",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a document conversion specialist. Convert documents to clean, well-structured markdown."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": "You are a document conversion specialist."},
+                    {"role": "user", "content": prompt}
                 ]
             )
             
-            return completion.choices[0].message.content
+            # Extract and return the converted markdown
+            converted_text = completion.choices[0].message.content
+            print(f"Successfully converted {len(truncated_content)} characters with LLM")
+            return converted_text
+            
         except Exception as e:
             print(f"Error using LLM for conversion: {e}")
             return None
-    
+
     def _enhance_with_llm(self, markdown_path):
         """Enhance the converted markdown with LLM"""
         try:
